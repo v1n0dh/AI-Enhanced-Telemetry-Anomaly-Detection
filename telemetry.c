@@ -2,7 +2,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
+
+#define SHM_NAME "/telemetry_shm"
+
+typedef struct {
+    float battery_voltage;
+    float battery_current;
+    float temperature;
+    unsigned long timestamp;
+} TelemetryData;
 
 // Reads the first line from a file
 char *readfile(const char *path) {
@@ -65,25 +77,73 @@ float read_network_throughput() {
 }
 
 int main() {
+	srand(time(NULL));
+
+	int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        return 1;
+    }
+
+	if (ftruncate(shm_fd, sizeof(TelemetryData)) == -1) {
+        perror("ftruncate");
+        return 1;
+    }
+
     FILE *fp = fopen("telemetry.csv", "w");
     if (!fp) {
         perror("Failed to open telemetry.csv");
         return 1;
     }
 
-    fprintf(fp, "cpu_temp_c,battery_pct,net_kbps\n");
-
-    for (int i = 0; i < 200; i++) {
-        float cpu_temp = read_cpu_temperature();
-        float battery = read_battery_percentage();
-        float net_kbps = read_network_throughput();
-
-        fprintf(fp, "%.2f,%.2f,%.2f\n", cpu_temp, battery, net_kbps);
-        fflush(fp);
-
-        usleep(1000000); // 1 second between samples
+	// Write CSV header if file empty
+    fseek(csv_fp, 0, SEEK_END);
+    long size = ftell(csv_fp);
+    if (size == 0) {
+        fprintf(csv_fp, "battery_voltage,battery_current,temperature,timestamp\n");
+        fflush(csv_fp);
     }
 
+	TelemetryData *shared_data = mmap(NULL, sizeof(TelemetryData),
+                                      PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      shm_fd, 0);
+    if (shared_data == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    printf("Telemetry producer started. Writing to shared memory...\n");
+
+    fprintf(fp, "cpu_temp_c,battery_pct,net_kbps\n");
+
+	while (1) {
+			float battery_voltage = read_battery_voltage();
+			float battery_current = read_battery_current();
+			float temperature = read_temperature();
+			unsigned long timestamp = (unsigned long)time(NULL);
+
+			// Write to shared memory
+			shared_data->battery_voltage = battery_voltage;
+			shared_data->battery_current = battery_current;
+			shared_data->temperature = temperature;
+			shared_data->timestamp = timestamp;
+
+			// Also append to CSV file
+			fprintf(csv_fp, "%.2f,%.2f,%.2f,%lu\n",
+					battery_voltage, battery_current, temperature, timestamp);
+			fflush(csv_fp);
+
+			printf("[Telemetry] V=%.2fV, I=%.2fA, Temp=%.2fC, Time=%lu\n",
+				   battery_voltage, battery_current, temperature, timestamp);
+
+			sleep(1);
+	}
+
+	munmap(shared_data, sizeof(TelemetryData));
+    close(shm_fd);
+    shm_unlink(SHM_NAME);
+
     fclose(fp);
+
     return 0;
 }
